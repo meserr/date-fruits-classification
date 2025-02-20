@@ -11,7 +11,7 @@ import numpy as np
 import json
 import matplotlib.pyplot as plt
 import warnings
-import torch.nn.functional as F
+import torchvision.transforms.functional as F
 warnings.filterwarnings('ignore')
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
