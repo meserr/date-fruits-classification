@@ -35,11 +35,9 @@ def get_transform():
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])
 
-# Load the datasets
 dataset = torchvision.datasets.ImageFolder("path", transform=get_transform())
 dataset_size = len(dataset)
 
-# Define the K-Fold Cross Validator
 k_folds = 10
 kfold = KFold(n_splits=k_folds, shuffle=True)
 
@@ -60,49 +58,58 @@ def initialize_model(model_name):
 
 
 class DirichletEnsemble:
-    def __init__(self, models, alpha=1.0):
+
+    def __init__(self, models, temperature=1.0, alpha=1.0):
         self.models = models
+        self.temperature = temperature
         self.alpha = alpha
     
     def predict(self, x):
         self.models = [model.eval() for model in self.models]
         with torch.no_grad():
-            predictions = torch.stack([model(x) for model in self.models])
-        predictions = nn.functional.softmax(predictions, dim=-1)
-        alpha_post = predictions + self.alpha
-        dirichlet_means = alpha_post / alpha_post.sum(dim=-1, keepdim=True)
-        return dirichlet_means.mean(dim=0)
-    
+            predictions = torch.stack([model(x) for model in self.models])            
+            scaled_predictions = predictions / self.temperature
+            probabilities = nn.functional.softmax(scaled_predictions, dim=-1)
+            alpha_posterior = probabilities + self.alpha      
+            total_concentration = alpha_posterior.sum(dim=-1, keepdim=True)
+            expected_probs = alpha_posterior / total_concentration           
+            ensemble_pred = expected_probs.mean(dim=0)
+            uncertainty = (1.0 / total_concentration.squeeze(-1)).mean(dim=0)           
+        return ensemble_pred, uncertainty
+
 def eval_Drichlet(model, val_loader):
     correct = 0
     total = 0
     val_running_loss = 0.0
     all_labels = []
     all_preds = []
+    all_uncertainties = []
     criterion = nn.CrossEntropyLoss()
-    ensemble.models = [model.eval() for model in ensemble.models]
+    
     with torch.no_grad():
         for inputs, labels in val_loader:
             inputs, labels = inputs.to(device), labels.to(device)
-            outputs = ensemble.predict(inputs)
+            outputs, uncertainty = ensemble.predict(inputs)
+            
             loss = criterion(outputs, labels)
             val_running_loss += loss.item()
+            
             _, predicted = torch.max(outputs, 1)
             total += labels.size(0)
             correct += (predicted == labels).sum().item()
+            
             all_labels.extend(labels.cpu().numpy())
             all_preds.extend(predicted.cpu().numpy())
-    val_loss.append(val_running_loss / len(val_loader))
-    val_accuracy.append(correct / total)
-
-    accuracy = val_accuracy[-1]
+            all_uncertainties.extend(uncertainty.cpu().numpy())
+    
+    accuracy = correct / total
     precision = precision_score(all_labels, all_preds, average='weighted', zero_division=0)
     recall = recall_score(all_labels, all_preds, average='weighted', zero_division=0)
     f1 = f1_score(all_labels, all_preds, average='weighted', zero_division=0)
+    
+    return accuracy, precision, recall, f1, val_running_loss / len(val_loader), all_uncertainties
 
-    return accuracy, precision, recall, f1, train_loss, val_loss, val_accuracy, all_labels, all_preds
-
-def train_and_evaluate(model, train_loader, val_loader, num_epochs=35):
+def train_and_evaluate(model, train_loader, val_loader, num_epochs=2):
     model = model.to(device)
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.Adam(model.parameters(), lr=0.001)
@@ -184,8 +191,8 @@ for fold, (train_ids, val_ids) in enumerate(kfold.split(dataset)):
         fold_metrics[model_names[i]]['preds'].extend(preds)
         print(f'{model_names[i]}: Fold {fold+1} Accuracy: {accuracy:.4f}, Precision: {precision:.4f}, Recall: {recall:.4f}, F1: {f1:.4f}')
 
-    ensemble = DirichletEnsemble(models)
-    accuracy, precision, recall, f1, _, _, _, labels, preds = eval_Drichlet(ensemble, val_loader)
+    ensemble = DirichletEnsemble(models, temperature=1.0, alpha=1.0)
+    accuracy, precision, recall, f1, val_loss, uncertainties = eval_Drichlet(ensemble, val_loader)
     dirichlet_results['accuracy'].append(accuracy)
     dirichlet_results['precision'].append(precision)
     dirichlet_results['recall'].append(recall)
@@ -195,7 +202,6 @@ for fold, (train_ids, val_ids) in enumerate(kfold.split(dataset)):
     print(f'DirichletEnsemble: Fold {fold+1} Accuracy: {accuracy:.4f}, Precision: {precision:.4f}, Recall: {recall:.4f}, F1: {f1:.4f}')
     print('--------------------------------')
 
-# Average results
 for name in model_names:
     print(f'{name}: Average Accuracy: {np.mean(results[name]["accuracy"]):.4f}, '
           f'Average Precision: {np.mean(results[name]["precision"]):.4f}, '
@@ -219,7 +225,6 @@ class NpEncoder(json.JSONEncoder):
             return obj.tolist()
         return super(NpEncoder, self).default(obj)
 
-# Her fold için metrikleri saklamak üzere bir sözlük oluştur
 metrics_data = {
     model_name: {
         'train_loss': [],
@@ -227,9 +232,8 @@ metrics_data = {
         'val_accuracy': [],
         'labels': [],
         'preds': []
-    } for model_name in model_names
+    } for model_name in model_names + ['DirichletEnsemble']
 }
-
 
 def update_metrics(metrics_data, model_names, fold_metrics, labels, preds):
     for model_name in model_names:
@@ -239,9 +243,11 @@ def update_metrics(metrics_data, model_names, fold_metrics, labels, preds):
         metrics_data[model_name]['labels'].append(fold_metrics[model_name]['labels'])
         metrics_data[model_name]['preds'].append(fold_metrics[model_name]['preds'])
         
+    metrics_data['DirichletEnsemble']['train_loss'].append([])
+    metrics_data['DirichletEnsemble']['val_loss'].append([])
+    metrics_data['DirichletEnsemble']['val_accuracy'].append([])
     metrics_data['DirichletEnsemble']['labels'].append(fold_metrics['DirichletEnsemble']['labels'])
     metrics_data['DirichletEnsemble']['preds'].append(fold_metrics['DirichletEnsemble']['preds'])
-
 
 update_metrics(metrics_data, model_names, fold_metrics, labels, preds)
 
